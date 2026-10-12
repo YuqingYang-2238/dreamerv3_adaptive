@@ -1,10 +1,17 @@
 import json
+import os
+import pathlib
 import random
 import subprocess
 import sys
 import time
 
 import numpy as np
+
+# World data for the fixed Mice world, read by cellworld instead of GitHub.
+# Must be set before cellworld is imported (it reads the variable at import).
+os.environ.setdefault(
+    'CELLWORLD_CACHE', str(pathlib.Path(__file__).parent / 'data' / '2105_world'))
 
 from prey_env import gym_Environment_D as Environment
 from prey_env.embodied_env import PreyFromGym
