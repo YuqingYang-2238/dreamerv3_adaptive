@@ -19,7 +19,8 @@ class PreyFromGym(from_gym.FromGym):
 
   LOG_SPACES = {
       'log_captured': embodied.Space(np.int32),  # captures during this step
-      'log_success': embodied.Space(bool),       # goal reached this step
+      'log_goal': embodied.Space(bool),          # goal reached this step
+      'log_success': embodied.Space(bool),       # goal reached with zero captures
       'log_timeout': embodied.Space(bool),       # truncated this step (no goal)
       'log_pred_x': embodied.Space(np.float32),  # true predator position,
       'log_pred_y': embodied.Space(np.float32),  # visible or not (for plots)
@@ -33,12 +34,13 @@ class PreyFromGym(from_gym.FromGym):
   def _obs(self, obs, reward, is_first=False, **kwargs):
     out = super()._obs(obs, reward, is_first=is_first, **kwargs)
     info = {} if is_first else self._info
-    success = bool(info.get('is success', False))
+    goal = bool(info.get('is success', False))
     predator = self._env.model.agents_data.get('predator')
     out.update(
         log_captured=np.int32(info.get('captured_this_step', 0)),
-        log_success=success,
-        log_timeout=bool(info.get('is truncated', False)) and not success,
+        log_goal=goal,
+        log_success=bool(info.get('survived', False)),
+        log_timeout=bool(info.get('is truncated', False)) and not goal,
         log_pred_x=np.float32(predator.location.x if predator else -1.0),
         log_pred_y=np.float32(predator.location.y if predator else -1.0))
     return out

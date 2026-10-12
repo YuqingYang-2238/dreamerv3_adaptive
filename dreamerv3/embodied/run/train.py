@@ -120,12 +120,13 @@ def train(agent, env, replay, logger, args, eval_env=None):
   eval_episodes = []
   def per_eval_episode(ep):
     vector = ep['vector']
-    success = bool(ep['log_success'].any())
+    goal = bool(ep['log_goal'].any())
     eval_episodes.append(dict(
         length=len(ep['reward']) - 1,
         score=float(ep['reward'].astype(np.float64).sum()),
-        success=success,
-        timeout=bool(ep['log_timeout'].any()) and not success,
+        goal=goal,
+        success=bool(ep['log_success'].any()),  # goal reached, never captured
+        timeout=bool(ep['log_timeout'].any()) and not goal,
         captures=int(ep['log_captured'].sum()),
         reward=ep['reward'],
         captured=ep['log_captured'],
@@ -150,10 +151,11 @@ def train(agent, env, replay, logger, args, eval_env=None):
     eps = list(eval_episodes)
     stack = lambda key: np.array([e[key] for e in eps])
     concat = lambda key: np.concatenate([e[key] for e in eps])
-    success, timeout = stack('success'), stack('timeout')
+    goal, success, timeout = stack('goal'), stack('success'), stack('timeout')
     captures, score, length = stack('captures'), stack('score'), stack('length')
     logger.add({
         'success_rate': success.mean(),
+        'goal_rate': goal.mean(),
         'timeout_rate': timeout.mean(),
         'capture_rate': (captures > 0).mean(),
         'captures_mean': captures.mean(),
@@ -167,7 +169,7 @@ def train(agent, env, replay, logger, args, eval_env=None):
         str(logdir / 'eval_trajs' / f'step_{int(step):08d}.npz'),
         step=int(step), updates=int(updates),
         ep_offsets=np.cumsum([0] + [len(e['reward']) for e in eps]),
-        ep_success=success, ep_timeout=timeout, ep_captures=captures,
+        ep_goal=goal, ep_success=success, ep_timeout=timeout, ep_captures=captures,
         ep_return=score, ep_length=length,
         prey_xy=concat('prey_xy'), pred_xy=concat('pred_xy'),
         pred_visible=concat('pred_visible'),

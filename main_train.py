@@ -89,7 +89,7 @@ def main():
       'run.eval_eps': 20,        # episodes per evaluation
       'run.eval_initial': True,  # also evaluate the untrained agent
       'run.log_keys_sum': 'log_captured',             # -> stats/sum_log_captured
-      'run.log_keys_max': 'log_success|log_timeout',  # -> stats/max_log_success, max_log_timeout
+      'run.log_keys_max': 'log_success|log_goal|log_timeout',  # -> stats/max_log_{success,goal,timeout}
       'run.log_zeros': True,     # keep all-zero episodes in those stats
       'batch_size': 16,
       'jax.prealloc': False,
