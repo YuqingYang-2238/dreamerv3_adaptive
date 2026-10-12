@@ -90,6 +90,43 @@ class JAXAgent(embodied.Agent):
     mets = self._convert_mets(mets, self.train_devices)
     return mets
 
+  # Learning marker: change of the critic's value estimates over time.
+  CRITIC_PREFIX = 'agent/task_behavior/critic/net/'
+
+  def snapshot_critic(self):
+    """References to the current critic-MLP parameters.
+
+    JAX arrays are immutable and train() rebinds self.varibs to a new dict,
+    so holding references is a free, on-device snapshot.
+    """
+    snap = {
+        k: v for k, v in self.varibs.items()
+        if k.startswith(self.CRITIC_PREFIX)}
+    assert snap, f'No parameters found under {self.CRITIC_PREFIX}'
+    return snap
+
+  def value_change(self, data, snapshot):
+    """Critic change between the snapshot and now on one replay batch.
+
+    Both evaluations use the current world model and the same rng, so they
+    score exactly the same latent states; only the critic parameters differ.
+    Returns 'value_change' = mean |V_now - V_snapshot| (the marker) and the
+    mean of each critic on that batch, all in reward units.
+    """
+    rng = self._next_rngs(self.train_devices)  # one rng for both calls
+    new, _ = self._value(self.varibs, rng, data)
+    old, _ = self._value({**self.varibs, **snapshot}, rng, data)
+    missing = set(snapshot) - self._value.keys
+    assert not missing, f'Snapshot keys not used by value(): {missing}'
+    new, old = self._convert_outs((new, old), self.train_devices)
+    new, old = new.astype(np.float64), old.astype(np.float64)
+    return {
+        'value_change': float(np.abs(new - old).mean()),
+        'value_new_mean': float(new.mean()),
+        'value_old_mean': float(old.mean()),
+        'value_new_abs_mean': float(np.abs(new).mean()),
+    }
+
   def dataset(self, generator):
     batcher = embodied.Batcher(
         sources=[generator] * self.batch_size,
@@ -157,16 +194,19 @@ class JAXAgent(embodied.Agent):
     self._policy = nj.pure(self.agent.policy)
     self._train = nj.pure(self.agent.train)
     self._report = nj.pure(self.agent.report)
+    self._value = nj.pure(self.agent.value)
     if len(self.train_devices) == 1:
       kw = dict(device=self.train_devices[0])
       self._init_train = nj.jit(self._init_train, **kw)
       self._train = nj.jit(self._train, **kw)
       self._report = nj.jit(self._report, **kw)
+      self._value = nj.jit(self._value, **kw)
     else:
       kw = dict(devices=self.train_devices)
       self._init_train = nj.pmap(self._init_train, 'i', **kw)
       self._train = nj.pmap(self._train, 'i', **kw)
       self._report = nj.pmap(self._report, 'i', **kw)
+      self._value = nj.pmap(self._value, 'i', **kw)
     if len(self.policy_devices) == 1:
       kw = dict(device=self.policy_devices[0])
       self._init_policy = nj.jit(self._init_policy, **kw)

@@ -101,6 +101,27 @@ class Agent(nj.Module):
       report.update({f'expl_{k}': v for k, v in mets.items()})
     return report
 
+  def value(self, data):
+    """Critic value V(h_t) for every timestep of a replay batch, shape [B, T].
+
+    Uses the same latent-inference path as WorldModel.loss (encoder ->
+    rssm.observe) and the task critic's mean prediction (reward scale).
+    Reads only parameters that train() already created, so it never adds
+    state entries. Posterior sampling in rssm.observe draws from nj.rng(),
+    so two calls with the same rng and world-model params give identical
+    latents.
+    """
+    self.config.jax.jit and print('Tracing value function.')
+    data = self.preprocess(data)
+    embed = self.wm.encoder(data)
+    prev_latent, prev_action = self.wm.initial(len(data['is_first']))
+    prev_actions = jnp.concatenate([
+        prev_action[:, None], data['action'][:, :-1]], 1)
+    post, _ = self.wm.rssm.observe(
+        embed, prev_actions, data['is_first'], prev_latent)
+    critic = self.task_behavior.ac.critics['extr']
+    return critic.net(post).mean().astype(jnp.float32)
+
   def preprocess(self, obs):
     obs = obs.copy()
     for key, value in obs.items():
