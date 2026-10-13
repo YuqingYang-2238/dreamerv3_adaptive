@@ -68,6 +68,11 @@ class Checkpoint:
       filename.write(basics.pack(data), mode='wb')
     self._log and print(f'Wrote checkpoint: {filename}')
 
+  def wait(self):
+    """Blocks until a pending parallel save has finished; re-raises its error."""
+    if self._parallel and self._promise:
+      self._promise.result()
+
   def load(self, filename=None, keys=None):
     assert self._filename or filename
     filename = path.Path(filename or self._filename)

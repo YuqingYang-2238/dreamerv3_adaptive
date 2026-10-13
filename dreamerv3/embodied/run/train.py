@@ -198,4 +198,5 @@ def train(agent, env, replay, logger, args, eval_env=None):
       checkpoint.save()
   run_eval()
   checkpoint.save()
+  checkpoint.wait()  # The process exits next; the save thread must finish first.
   logger.write()
