@@ -40,6 +40,18 @@ def tensorstats(tensor, prefix=None):
   return metrics
 
 
+def lambda_return(rew, disc, value, lam, mask=None):
+  """TD(lambda) targets for states 0..H-1 from rew/disc [H, B] and value [H+1, B].
+  mask [H, B] (optional): mask[t] = 1 if transition t+1 is accepted; where it is 0 the
+  target at t bootstraps fully from value[t+1]. mask[H-1] has no effect."""
+  vals = [value[-1]]
+  interm = rew + disc * value[1:] * (1 - lam)
+  for t in reversed(range(len(disc))):
+    nxt = vals[-1] if mask is None else mask[t] * vals[-1] + (1 - mask[t]) * value[t + 1]
+    vals.append(interm[t] + disc[t] * lam * nxt)
+  return jnp.stack(list(reversed(vals))[:-1])
+
+
 def subsample(values, amount=1024):
   values = values.flatten()
   if len(values) > amount:
@@ -258,11 +270,13 @@ class Moments(nj.Module):
     else:
       raise NotImplementedError(self.impl)
 
-  def __call__(self, x):
-    self.update(x)
+  def __call__(self, x, mask=None):
+    self.update(x, mask)
     return self.stats()
 
-  def update(self, x):
+  def update(self, x, mask=None):
+    if mask is not None:
+      return self._update_masked(x, mask)
     if parallel():
       mean = lambda x: jax.lax.pmean(x.mean(), 'i')
       min_ = lambda x: jax.lax.pmin(x.min(), 'i')
@@ -302,6 +316,19 @@ class Moments(nj.Module):
       self.mag.write(m * jnp.maximum(self.mag.read(), curr) + (1 - m) * curr)
     else:
       raise NotImplementedError(self.impl)
+
+  def _update_masked(self, x, mask):
+    """perc_ema on the entries where mask > 0; unchanged if there are none."""
+    assert self.impl == 'perc_ema', self.impl
+    x = jnp.where(mask > 0, sg(x.astype(jnp.float32)), jnp.nan)
+    if parallel():
+      x, mask = jax.lax.all_gather(x, 'i'), jax.lax.all_gather(mask, 'i')
+    some = mask.sum() > 0
+    m = self.decay
+    low = jnp.where(some, jnp.nanpercentile(x, self.perclo), self.low.read())
+    high = jnp.where(some, jnp.nanpercentile(x, self.perchi), self.high.read())
+    self.low.write(jnp.where(some, m * self.low.read() + (1 - m) * low, self.low.read()))
+    self.high.write(jnp.where(some, m * self.high.read() + (1 - m) * high, self.high.read()))
 
   def stats(self):
     if self.impl == 'off':

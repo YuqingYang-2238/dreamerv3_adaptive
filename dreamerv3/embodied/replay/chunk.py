@@ -69,8 +69,15 @@ class Chunk:
   @classmethod
   def scan(cls, directory, capacity=None, shorten=0):
     directory = embodied.Path(directory)
+    # A partial chunk is re-saved at every checkpoint under the same uuid with
+    # a growing length; the longest file per uuid holds all of its steps.
+    longest = {}
+    for filename in directory.glob('*.npz'):
+      uuid, length = filename.stem.split('-')[1], int(filename.stem.split('-')[3])
+      if uuid not in longest or length > int(longest[uuid].stem.split('-')[3]):
+        longest[uuid] = filename
     filenames, total = [], 0
-    for filename in reversed(sorted(directory.glob('*.npz'))):
+    for filename in reversed(sorted(longest.values())):
       if capacity and total >= capacity:
         break
       filenames.append(filename)

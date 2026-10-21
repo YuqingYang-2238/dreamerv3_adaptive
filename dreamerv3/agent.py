@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import ruamel.yaml as yaml
 tree_map = jax.tree_util.tree_map
 sg = lambda x: tree_map(jax.lax.stop_gradient, x)
+masked_mean = lambda x, m: (x * m).sum() / jnp.maximum(m.sum(), 1.0)
 
 import logging
 logger = logging.getLogger()
@@ -13,6 +14,7 @@ class CheckTypesFilter(logging.Filter):
 logger.addFilter(CheckTypesFilter())
 
 from . import behaviors
+from . import expl
 from . import jaxagent
 from . import jaxutils
 from . import nets
@@ -38,6 +40,12 @@ class Agent(nj.Module):
     else:
       self.expl_behavior = getattr(behaviors, config.expl_behavior)(
           self.wm, self.act_space, self.config, name='expl_behavior')
+    if config.disag_measure:
+      # Plan2Explore ensemble, measured only: never a reward, never a gradient to the agent.
+      self.disag = expl.Disag(self.wm, self.act_space, self.config, name='disag')
+    if config.imag_adaptive:
+      assert config.disag_measure and list(config.disag_target) == ['embed'], \
+          'imag_adaptive needs disag_measure True and disag_target [embed]'
 
   def policy_initial(self, batch_size):
     return (
@@ -53,8 +61,10 @@ class Agent(nj.Module):
     obs = self.preprocess(obs)
     (prev_latent, prev_action), task_state, expl_state = state
     embed = self.wm.encoder(obs)
-    latent, _ = self.wm.rssm.obs_step(
+    latent, prior = self.wm.rssm.obs_step(
         prev_latent, prev_action, embed, obs['is_first'])
+    # One-step surprise of the world model: KL(posterior || prior), as train/dyn_kl_mean.
+    kl = self.wm.rssm.dyn_loss(latent, prior, impl='kl', free=0.0)
     self.expl_behavior.policy(latent, expl_state)
     task_outs, task_state = self.task_behavior.policy(latent, task_state)
     expl_outs, expl_state = self.expl_behavior.policy(latent, expl_state)
@@ -70,22 +80,38 @@ class Agent(nj.Module):
       outs = task_outs
       outs['log_entropy'] = outs['action'].entropy()
       outs['action'] = outs['action'].sample(seed=nj.rng())
+    outs['log_kl'] = kl.astype(jnp.float32)
+    if self.config.disag_measure:   # D_t on the current posterior and the chosen action
+      outs['log_disag'] = self.disag.disagreement({**latent, 'action': outs['action']})
+      # Prediction error one step late: the heads' mean prediction of e_t from the previous
+      # (h, z, a) against the actual e_t. Meaningless on an episode's first step (drop it there).
+      pred = self.disag.predictions({**prev_latent, 'action': prev_action}).mean(0)
+      outs['log_disag_err'] = ((pred - embed.astype(jnp.float32)) ** 2).mean(-1)
     state = ((latent, outs['action']), task_state, expl_state)
     return outs, state
 
-  def train(self, data, state):
-    self.config.jax.jit and print('Tracing train function.')
+  def train(self, data, state, rollouts=1):
+    # rollouts: imagined trajectories per starting state (static under jit;
+    # 1 = the baseline budget, 2 = the adaptive controller's extra budget).
+    self.config.jax.jit and print(f'Tracing train function (rollouts={rollouts}).')
     metrics = {}
     data = self.preprocess(data)
     state, wm_outs, mets = self.wm.train(data, state)
     metrics.update(mets)
     context = {**data, **wm_outs['post']}
     start = tree_map(lambda x: x.reshape([-1] + list(x.shape[2:])), context)
-    _, mets = self.task_behavior.train(self.wm.imagine, start, context)
+    # Disagreement of every imagined step: logged always, cuts rollouts if imag_adaptive.
+    cutoff = self.disag.disagreement if self.config.disag_measure else None
+    _, mets = self.task_behavior.train(
+        self.wm.imagine, start, context, rollouts=rollouts, cutoff=cutoff)
     metrics.update(mets)
     if self.config.expl_behavior != 'None':
       _, mets = self.expl_behavior.train(self.wm.imagine, start, context)
       metrics.update({'expl_' + key: value for key, value in mets.items()})
+    if self.config.disag_measure:
+      # Last on purpose: nj.grad draws an rng key, so the actor-critic draws stay
+      # identical to a run without the ensemble.
+      metrics.update(self.disag.train({**context, 'embed': wm_outs['embed']}))  # disag_opt_*
     outs = {}
     return outs, state, metrics
 
@@ -121,6 +147,61 @@ class Agent(nj.Module):
         embed, prev_actions, data['is_first'], prev_latent)
     critic = self.task_behavior.ac.critics['extr']
     return critic.net(post).mean().astype(jnp.float32)
+
+  def kl_measure(self, data):
+    """World-model dynamics KL(posterior || prior) on a replay batch, same latent path as value().
+
+    Mean over the batch's steps, excluding episode starts (their prior is the initial state).
+    """
+    self.config.jax.jit and print('Tracing kl_measure function.')
+    data = self.preprocess(data)
+    embed = self.wm.encoder(data)
+    prev_latent, prev_action = self.wm.initial(len(data['is_first']))
+    prev_actions = jnp.concatenate([
+        prev_action[:, None], data['action'][:, :-1]], 1)
+    post, prior = self.wm.rssm.observe(
+        embed, prev_actions, data['is_first'], prev_latent)
+    kl = self.wm.rssm.dyn_loss(post, prior, impl='kl', free=0.0)
+    mask = 1.0 - data['is_first'].astype(jnp.float32)
+    vis = mask * self.predator_visible(data)
+    return {'dyn_kl': masked_mean(kl, mask), 'dyn_kl_visible': masked_mean(kl, vis)}
+
+  @staticmethod
+  def predator_visible(data):
+    """1 where the prey's observation holds the predator (obs entry 5 = pred_x, sentinel -1)."""
+    return (data['vector'][..., 5] >= 0).astype(jnp.float32)
+
+  def disag_measure(self, data):
+    """Ensemble disagreement on a replay batch, same latent path as value().
+
+    D per (state, action) = unbiased variance across heads, mean over embedding
+    dims. Returns its mean and variance over the B x T pairs, the ensemble-mean
+    prediction MSE per dim against e_{t+1} (reset-crossing pairs excluded) and
+    the embedding RMS. Reads only parameters that train() created.
+    """
+    self.config.jax.jit and print('Tracing disag_measure function.')
+    data = self.preprocess(data)
+    embed = self.wm.encoder(data)
+    prev_latent, prev_action = self.wm.initial(len(data['is_first']))
+    prev_actions = jnp.concatenate([
+        prev_action[:, None], data['action'][:, :-1]], 1)
+    post, _ = self.wm.rssm.observe(
+        embed, prev_actions, data['is_first'], prev_latent)
+    preds = self.disag.predictions({**post, 'action': data['action']})  # [K, B, T, d]
+    disag = preds.var(0, ddof=1).mean(-1)                                # [B, T]
+    embed = embed.astype(jnp.float32)
+    mask = 1.0 - data['is_first'][:, 1:].astype(jnp.float32)
+    err = ((preds.mean(0)[:, :-1] - embed[:, 1:]) ** 2).mean(-1)
+    vis = self.predator_visible(data)   # split by what the prey sees at t
+    return {
+        'disag': disag.mean(),
+        'disag_var': disag.var(ddof=1),
+        'disag_visible': masked_mean(disag, vis),
+        'disag_hidden': masked_mean(disag, 1.0 - vis),
+        'disag_mse': masked_mean(err, mask),
+        'disag_mse_visible': masked_mean(err, mask * vis[:, :-1]),
+        'embed_rms': jnp.sqrt((embed ** 2).mean()),
+    }
 
   def preprocess(self, obs):
     obs = obs.copy()
@@ -199,10 +280,17 @@ class WorldModel(nj.Module):
     metrics = self._metrics(data, dists, post, prior, losses, model_loss)
     return model_loss.mean(), (state, out, metrics)
 
-  def imagine(self, policy, start, horizon):
+  def imagine(self, policy, start, horizon, rollouts=1):
     first_cont = (1.0 - start['is_terminal']).astype(jnp.float32)
     keys = list(self.rssm.initial(1).keys())
     start = {k: v for k, v in start.items() if k in keys}
+    if rollouts > 1:
+      # Same starting states, repeated: every sample below (first action,
+      # prior stoch, later actions) is drawn per batch element from one key
+      # per step, so each repeat is an independent rollout, not a copy.
+      tile = lambda x: jnp.tile(x, (rollouts,) + (1,) * (x.ndim - 1))
+      start = {k: tile(v) for k, v in start.items()}
+      first_cont = tile(first_cont)
     start['action'] = policy(start)
     def step(prev, _):
       prev = prev.copy()
@@ -244,6 +332,7 @@ class WorldModel(nj.Module):
     metrics.update(jaxutils.tensorstats(entropy(post), 'post_ent'))
     metrics.update({f'{k}_loss_mean': v.mean() for k, v in losses.items()})
     metrics.update({f'{k}_loss_std': v.std() for k, v in losses.items()})
+    metrics['dyn_kl_mean'] = self.rssm.dyn_loss(post, prior, impl='kl', free=0.0).mean()
     metrics['model_loss_mean'] = model_loss.mean()
     metrics['model_loss_std'] = model_loss.std()
     metrics['reward_max_data'] = jnp.abs(data['reward']).max()
@@ -276,6 +365,10 @@ class ImagActorCritic(nj.Module):
         k: jaxutils.Moments(**config.retnorm, name=f'retnorm_{k}')
         for k in critics}
     self.opt = jaxutils.Optimizer(name='actor_opt', **config.actor_opt)
+    # MACURA threshold state: circular list of past start-state percentiles, rounds so far.
+    self.kappa_hist = nj.Variable(
+        jnp.zeros, (config.imag_kappa_history,), jnp.float32, name='kappa_hist')
+    self.kappa_rounds = nj.Variable(jnp.zeros, (), jnp.int32, name='kappa_rounds')
 
   def initial(self, batch_size):
     return {}
@@ -283,11 +376,17 @@ class ImagActorCritic(nj.Module):
   def policy(self, state, carry):
     return {'action': self.actor(state)}, carry
 
-  def train(self, imagine, start, context):
+  def train(self, imagine, start, context, rollouts=1, cutoff=None):
     def loss(start):
       policy = lambda s: self.actor(sg(s)).sample(seed=nj.rng())
-      traj = imagine(policy, start, self.config.imag_horizon)
-      loss, metrics = self.loss(traj)
+      traj = imagine(policy, start, self.config.imag_horizon, rollouts)
+      cmets = {}
+      if cutoff is not None:
+        mask, cmets = self.cutoff(traj, cutoff)
+        if self.config.imag_adaptive:
+          traj['mask'] = mask
+      loss, metrics = self.loss(traj, rollouts)
+      metrics.update(cmets)
       return loss, (traj, metrics)
     mets, (traj, metrics) = self.opt(self.actor, loss, start, has_aux=True)
     metrics.update(mets)
@@ -296,13 +395,42 @@ class ImagActorCritic(nj.Module):
       metrics.update({f'{key}_critic_{k}': v for k, v in mets.items()})
     return traj, metrics
 
-  def loss(self, traj):
+  def cutoff(self, traj, disagreement):
+    """MACURA rollout adaption (macura.py rollout_model_and_populate_sac_buffer).
+    Returns mask [H+1, B]: 1 while every disagreement up to transition t is below kappa;
+    last row 0. Threshold from the start states, averaged over past rounds."""
+    D = sg(disagreement({k: traj[k] for k in ('deter', 'stoch', 'action')})).astype(jnp.float32)
+    H = D.shape[0] - 1
+    W = self.config.imag_kappa_history
+    hist, n = self.kappa_hist.read(), self.kappa_rounds.read()
+    b = self.config.imag_xi * jnp.percentile(D[0], self.config.imag_zeta)
+    count = jnp.where(n < W, n, W - 1).astype(jnp.float32)  # current_border_count
+    est = jnp.where(n > 0, hist.sum() / jnp.maximum(jnp.minimum(n, W), 1), 0.0)
+    kappa = (b + count * est) / (count + 1)
+    self.kappa_hist.write(hist.at[n % W].set(b))
+    self.kappa_rounds.write(n + 1)
+    acc = jnp.cumprod((D[:-1] < kappa).astype(jnp.float32), 0)
+    mask = jnp.concatenate([acc, jnp.zeros_like(acc[:1])], 0)
+    length = acc.sum(0)
+    mets = {
+        'imag_kappa': kappa, 'imag_b': b, 'imag_kappa_rounds': (n + 1).astype(jnp.float32),
+        'imag_accepted_mean': length.mean(), 'imag_accepted_total': acc.sum(),
+        'imag_frac_zero': (length == 0).mean(), 'imag_frac_full': (length == H).mean(),
+        'imag_frac_len_1_4': ((length >= 1) & (length <= 4)).mean(),
+        'imag_frac_len_5_9': ((length >= 5) & (length <= 9)).mean(),
+        'imag_frac_len_10_14': ((length >= 10) & (length < H)).mean(),
+        'imag_disag_mean': D[:-1].mean()}
+    mets.update({f'imag_disag_d{d}': D[d].mean() for d in sorted({0, H // 3, 2 * H // 3, H - 1})})
+    return sg(mask), mets
+
+  def loss(self, traj, rollouts=1):
     metrics = {}
     advs = []
     total = sum(self.scales[k] for k in self.critics)
+    mask = traj['mask'][:-1] if 'mask' in traj else None  # state t valid iff transition t accepted
     for key, critic in self.critics.items():
       rew, ret, base = critic.score(traj, self.actor)
-      offset, invscale = self.retnorms[key](ret)
+      offset, invscale = self.retnorms[key](ret, mask)
       normed_ret = (ret - offset) / invscale
       normed_base = (base - offset) / invscale
       advs.append((normed_ret - normed_base) * self.scales[key] / total)
@@ -318,11 +446,27 @@ class ImagActorCritic(nj.Module):
     loss -= self.config.actent * ent
     loss *= sg(traj['weight'])[:-1]
     loss *= self.config.loss_scales.actor
-    metrics.update(self._metrics(traj, policy, logpi, ent, adv))
+    metrics.update(self._metrics(traj, policy, logpi, ent, adv, rollouts))
+    if mask is not None:  # mean over accepted steps; 0 if none
+      return (loss * mask).sum() / jnp.maximum(mask.sum(), 1.0), metrics
     return loss.mean(), metrics
 
-  def _metrics(self, traj, policy, logpi, ent, adv):
+  def _metrics(self, traj, policy, logpi, ent, adv, rollouts=1):
     metrics = {}
+    # Imagination budget actually used by this update (static shapes).
+    metrics['imag_trajs'] = float(traj['action'].shape[1])
+    metrics['imag_horizon'] = float(len(traj['action']) - 1)
+    if rollouts > 1 and self.act_space.discrete:
+      # Agreement between the two repeats of each start state. Independent
+      # draws agree with probability sum_a p1(a) p2(a) under the policies at
+      # the two repeats' (diverging) states, so the empirical rate must track
+      # imag_half_match_expected; a duplicated rollout would give exactly 1.
+      n = traj['action'].shape[1] // rollouts
+      act = jnp.argmax(traj['action'], -1)
+      probs = policy.probs_parameter()
+      metrics['imag_half_match'] = (act[:, :n] == act[:, n:2 * n]).mean()
+      metrics['imag_half_match_expected'] = (
+          probs[:, :n] * probs[:, n:2 * n]).sum(-1).mean()
     ent = policy.entropy()[:-1]
     rand = (ent - policy.minent) / (policy.maxent - policy.minent)
     rand = rand.mean(range(2, len(rand.shape)))
@@ -372,7 +516,10 @@ class VFunction(nj.Module):
     else:
       raise NotImplementedError(self.config.critic_slowreg)
     loss += self.config.loss_scales.slowreg * reg
-    loss = (loss * sg(traj['weight'])).mean()
+    if 'mask' in traj:  # mean over accepted steps; 0 if none
+      loss = (loss * sg(traj['weight']) * traj['mask']).sum() / jnp.maximum(traj['mask'].sum(), 1.0)
+    else:
+      loss = (loss * sg(traj['weight'])).mean()
     loss *= self.config.loss_scales.critic
     metrics = jaxutils.tensorstats(dist.mean())
     return loss, metrics
@@ -384,9 +531,6 @@ class VFunction(nj.Module):
     discount = 1 - 1 / self.config.horizon
     disc = traj['cont'][1:] * discount
     value = self.net(traj).mean()
-    vals = [value[-1]]
-    interm = rew + disc * value[1:] * (1 - self.config.return_lambda)
-    for t in reversed(range(len(disc))):
-      vals.append(interm[t] + disc[t] * self.config.return_lambda * vals[-1])
-    ret = jnp.stack(list(reversed(vals))[:-1])
+    mask = traj['mask'][1:] if 'mask' in traj else None  # rejected t+1 -> bootstrap at t+1
+    ret = jaxutils.lambda_return(rew, disc, value, self.config.return_lambda, mask)
     return rew, ret, value[:-1]

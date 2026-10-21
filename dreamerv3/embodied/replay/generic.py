@@ -134,8 +134,8 @@ class Generic:
     # }
 
   def load(self, data=None):
-    if not self.saver:
-      return
+    if not self.saver or self.table:
+      return  # Chunks were read in __init__; Checkpoint.load calls this again.
     workers = set()
     for step, worker in self.saver.load(self.capacity, self.length):
       workers.add(worker)

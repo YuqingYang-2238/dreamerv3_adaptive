@@ -31,6 +31,7 @@ defaults:
     eval_every: 1e6
     eval_initial: True
     eval_eps: 1
+    eval_burn_in: 0  # unscored episodes before each evaluation (predator memory warm-up)
     eval_samples: 1
     train_ratio: 32.0
     train_fill: 0
@@ -40,12 +41,15 @@ defaults:
     log_keys_sum: '^$'
     log_keys_mean: '(log_entropy)'
     log_keys_max: '^$'
-    from_checkpoint: ''
     sync_every: 10
     # actor_addr: 'tcp://127.0.0.1:5551'
     actor_addr: 'ipc:///tmp/5551'
     actor_batch: 32
     value_change_every: 2000  # env steps between |V_k - V_{k-delta}| measurements; 0 = off
+    keep_every: 0  # env steps between extra checkpoint_<step>.ckpt copies; 0 = off
+    adaptive: False  # signal-adaptive imagination: Bernoulli(p_extra) gate on 2x imagined trajectories per update
+    adaptive_c: 0.0  # reference recent-experience value change (median of the pretraining run); required if adaptive
+    imag_extra_rollouts: 2  # imagined trajectories per start state when the gate fires (baseline: 1)
 
   envs: {amount: 4, parallel: process, length: 0, reset: True, restart: True, discretize: 0, checks: False}
   wrapper: {length: 0, reset: True, discretize: 0, checks: False}
@@ -55,6 +59,7 @@ defaults:
     minecraft: {size: [64, 64], break_speed: 100.0}
     dmc: {size: [64, 64], repeat: 2, camera: -1}
     loconav: {size: [64, 64], repeat: 2, camera: -1}
+    prey: {predator_strategy: default, predator_surge_speed: 1.0}  # strategy: 'default' (decoupled wander, incidental captures) or 'ambush' (sit-and-wait, pursues inside its 3-cell region) or 'none'; ambush attack speed as a multiple of the predator max speed
 
   # Agent
   task_behavior: Greedy
@@ -87,6 +92,10 @@ defaults:
   critic_type: vfunction
   imag_horizon: 15
   imag_unroll: False
+  imag_adaptive: False  # MACURA cutoff: drop imagined steps once ensemble disagreement >= kappa (needs disag_measure)
+  imag_xi: 1.0  # MACURA xi: scale of the start-state percentile
+  imag_zeta: 95.0  # MACURA zeta: percentile of first-step disagreement
+  imag_kappa_history: 2000  # MACURA unc_tresh_run_avg_history: rounds averaged into kappa
   horizon: 333
   return_lambda: 0.95
   critic_slowreg: logprob
@@ -101,6 +110,7 @@ defaults:
   disag_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: mse, outscale: 1.0, inputs: [deter, stoch, action], winit: normal, fan: avg}
   disag_target: [stoch]
   disag_models: 8
+  disag_measure: False  # train the Disag ensemble as a measured-only learning signal (learning/disag*, log_disag); never a reward
 
 minecraft:
 

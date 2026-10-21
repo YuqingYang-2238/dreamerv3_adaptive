@@ -2,13 +2,43 @@ from cellworld import Location
 from myPaths import *
 from random import choice
 from Agent import *
+from geometry import Geometry, heading, ROBOT
+
+CLEARANCE = max(abs(y) for _, y in ROBOT)   # body half-width kept off the obstacles when choosing waypoints
+
+
+def neighbours(world: World) -> dict:
+    """{cell id: cells sharing an edge with it} on the hexagonal grid (6 for interior cells)."""
+    cells = list(world.cells)
+    spacing = min(cells[0].location.dist(c.location) for c in cells[1:])
+    return {c.id: [d for d in cells if d is not c and c.location.dist(d.location) <= 1.2 * spacing]
+            for c in cells}
+
+
+_DECOUPLED_CELLS = {}  # cached per occlusion layout: the world object is rebuilt every episode
+
+
+def decoupled_cells(world: World) -> tuple:
+    """(spawn candidates, destination candidates) of the paper's Decoupled robot:
+    free cells not adjacent to an obstacle; destinations also not adjacent to a wall."""
+    key = tuple(c.id for c in world.cells.occluded_cells())
+    if key not in _DECOUPLED_CELLS:
+        near = neighbours(world)
+        clear = [c.id for c in world.cells.free_cells() if not any(d.occluded for d in near[c.id])]
+        _DECOUPLED_CELLS[key] = (clear, [i for i in clear if len(near[i]) == 6])
+    clear, interior = _DECOUPLED_CELLS[key]
+    return [world.cells[i] for i in clear], [world.cells[i] for i in interior]
 
 
 class Predator(Agent):
+    """Default scripted predator, the "Decoupled" robot of the mouse experiments: it moves
+    continuously to randomly selected free cells not adjacent to walls or obstacles, with no
+    coupling to the prey's position. Captures happen only when the prey comes close by chance."""
+
     def __init__(self,
                  pworld: World,
                  ppath_builder: Paths_builder,
-                 pvisibility: Location_visibility,
+                 pvisibility: Geometry,
                  pP_value: float = .1,
                  pI_value: float = .1,
                  pD_value: float = .1,
@@ -19,6 +49,7 @@ class Predator(Agent):
         self.visibility = pvisibility
         self.destination = None
         self.destination_cell = None
+        self.path = Cell_group()
         self.P_value = pP_value
         self.I_value = pI_value
         self.D_value = pD_value
@@ -26,40 +57,37 @@ class Predator(Agent):
         self.accum_theta_error = 0
         self.max_speed = pmax_speed
         self.max_turning_speed = pmax_turning_speed
+        self.destination_cells = decoupled_cells(pworld)[1]
 
-    def __update_destination__(self, predator_location: Location, prey_location: Location = None):
+    def _follow_path(self, predator_location: Location, destination_cell: Cell) -> None:
+        """Plans a path to destination_cell and aims at the furthest path cell reachable in a
+        straight line with the body's clearance (so the body does not cut corners)."""
+        self.destination_cell = destination_cell
+        predator_cell = self.world.cells[self.world.cells.find(predator_location)]
+        self.path = self.paths.get_path(predator_cell, destination_cell)
+        self.destination = self.path[min(1, len(self.path) - 1)].location
+        for cd in self.path:
+            if self.visibility.is_clear(predator_location, cd.location, CLEARANCE):
+                self.destination = cd.location
+
+    def __update_destination__(self, predator_location: Location):
         if self.destination_cell and \
                 predator_location.dist(self.destination_cell.location) < self.world.implementation.cell_transformation.size / 2:
             self.destination_cell = None
-        if prey_location:
-            self.destination_cell = self.world.cells[self.world.cells.find(prey_location)]
         if self.destination_cell is None:
-            hidden_cells = Cell_group()
-            for c in self.world.cells:
-                if c.occluded:
-                    continue
-                if not self.visibility.is_visible(predator_location, c.location):
-                    hidden_cells.append(c)
-            self.destination_cell = choice(hidden_cells)
-        predator_cell = self.world.cells[self.world.cells.find(predator_location)]
-        self.path = self.paths.get_path(predator_cell, self.destination_cell)
-        for cd in self.path:
-            if self.visibility.is_visible(predator_location, cd.location):
-                self.destination = cd.location
+            self.destination_cell = choice(self.destination_cells)
+        self._follow_path(predator_location, self.destination_cell)
 
     @staticmethod
     def normalized_error(theta_error: float):
         pi_err = math.pi * theta_error / 2
         return 1 / (pi_err * pi_err + 1)
 
-    def get_action(self, observation: dict) -> AgentAction:
-        prey = observation["prey"]
-        predator = observation["predator"]
-        if prey:
-            self.__update_destination__(predator.location, prey.location)
-        else:
-            self.__update_destination__(predator.location)
-        desired_theta = predator.location.atan(self.destination)
+    def _steer(self, predator: AgentData) -> AgentAction:
+        """PID heading control toward self.destination; speed drops with heading error."""
+        if self.destination is None:
+            return AgentAction(0, 0)
+        desired_theta = heading(predator.location, self.destination)
         theta_error, direction = angle_difference(predator.theta, desired_theta)
         dist_error = predator.location.dist(self.destination)
         self.accum_theta_error += theta_error
@@ -77,3 +105,8 @@ class Predator(Agent):
             speed = self.max_speed
         self.last_theta = predator.theta
         return AgentAction(speed, turning_speed)
+
+    def get_action(self, observation: dict) -> AgentAction:
+        predator = observation["predator"]
+        self.__update_destination__(predator.location)
+        return self._steer(predator)

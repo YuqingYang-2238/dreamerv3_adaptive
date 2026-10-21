@@ -1,12 +1,4 @@
 """Plot the learning curve and the value-change marker of one DreamerV3 run.
-
-Usage:
-  python scores/plot_learning.py LOGDIR [--out PATH]
-
-Reads <logdir>/metrics.jsonl and <logdir>/eval_trajs/step_*.npz and draws
-three panels on a shared env-step axis: evaluation rates, episode return,
-and the critic value-change marker (raw points plus a smoothed line).
-Saves to <logdir>/learning_curve.png unless --out is given.
 """
 
 import argparse

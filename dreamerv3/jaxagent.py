@@ -65,12 +65,14 @@ class JAXAgent(embodied.Agent):
     state = self._convert_outs(state, self.policy_devices)
     return outs, state
 
-  def train(self, data, state=None):
+  def train(self, data, state=None, rollouts=1):
+    # rollouts is a static jit argument: each value is its own compiled
+    # program, so only the requested imagination budget is ever generated.
     rng = self._next_rngs(self.train_devices)
     if state is None:
       state, self.varibs = self._init_train(self.varibs, rng, data['is_first'])
     (outs, state, mets), self.varibs = self._train(
-        self.varibs, rng, data, state)
+        self.varibs, rng, data, state, rollouts=int(rollouts))
     outs = self._convert_outs(outs, self.train_devices)
     self._updates.increment()
     if self._should_metrics(self._updates):
@@ -94,25 +96,28 @@ class JAXAgent(embodied.Agent):
   CRITIC_PREFIX = 'agent/task_behavior/critic/net/'
 
   def snapshot_critic(self):
-    """References to the current critic-MLP parameters.
-
-    JAX arrays are immutable and train() rebinds self.varibs to a new dict,
-    so holding references is a free, on-device snapshot.
-    """
+    """Host copy of the current critic-MLP parameters (picklable)."""
     snap = {
         k: v for k, v in self.varibs.items()
         if k.startswith(self.CRITIC_PREFIX)}
     assert snap, f'No parameters found under {self.CRITIC_PREFIX}'
-    return snap
+    if len(self.train_devices) > 1:
+      snap = tree_map(lambda x: x[0], snap)
+    return tree_map(np.asarray, jax.device_get(snap))
 
   def value_change(self, data, snapshot):
     """Critic change between the snapshot and now on one replay batch.
 
     Both evaluations use the current world model and the same rng, so they
     score exactly the same latent states; only the critic parameters differ.
-    Returns 'value_change' = mean |V_now - V_snapshot| (the marker) and the
-    mean of each critic on that batch, all in reward units.
+    Returns 'value_change' = mean |V_now - V_snapshot| (the marker), the
+    std of V_now - V_snapshot (change beyond a uniform shift) and the mean
+    of each critic on that batch, all in reward units.
     """
+    if len(self.train_devices) == 1:
+      snapshot = jax.device_put(snapshot, self.train_devices[0])
+    else:
+      snapshot = jax.device_put_replicated(snapshot, self.train_devices)
     rng = self._next_rngs(self.train_devices)  # one rng for both calls
     new, _ = self._value(self.varibs, rng, data)
     old, _ = self._value({**self.varibs, **snapshot}, rng, data)
@@ -122,15 +127,35 @@ class JAXAgent(embodied.Agent):
     new, old = new.astype(np.float64), old.astype(np.float64)
     return {
         'value_change': float(np.abs(new - old).mean()),
+        'value_delta_std': float((new - old).std()),
         'value_new_mean': float(new.mean()),
         'value_old_mean': float(old.mean()),
         'value_new_abs_mean': float(np.abs(new).mean()),
     }
 
-  def dataset(self, generator):
+  @property
+  def measures_disag(self):
+    """True when the agent trains the measured-only Plan2Explore ensemble."""
+    return hasattr(self.agent, 'disag')
+
+  def kl_measure(self, data):
+    """World-model dynamics KL on one batch (episode starts excluded)."""
+    rng = self._next_rngs(self.train_devices)
+    mets, _ = self._kl_measure(self.varibs, rng, data)
+    mets = self._convert_mets(mets, self.train_devices)
+    return {k: float(v) for k, v in mets.items()}
+
+  def disag_measure(self, data):
+    """Ensemble disagreement (mean, variance), prediction MSE and embed RMS on one batch."""
+    rng = self._next_rngs(self.train_devices)
+    mets, _ = self._disag_measure(self.varibs, rng, data)
+    mets = self._convert_mets(mets, self.train_devices)
+    return {k: float(v) for k, v in mets.items()}
+
+  def dataset(self, generator, workers=None):
     batcher = embodied.Batcher(
         sources=[generator] * self.batch_size,
-        workers=self.data_loaders,
+        workers=self.data_loaders if workers is None else workers,
         postprocess=lambda x: self._convert_inps(x, self.train_devices),
         prefetch_source=4, prefetch_batch=1)
     return batcher()
@@ -145,6 +170,15 @@ class JAXAgent(embodied.Agent):
     return data
 
   def load(self, state):
+    if self.measures_disag:   # otherwise policy() would silently initialise random heads
+      assert any(k.startswith('agent/disag/') for k in state), \
+          'disag_measure is on but the checkpoint has no ensemble parameters'
+    # Older checkpoints lack the MACURA threshold state: start it empty.
+    missing = [k for k in self.varibs if '/kappa_' in k and k not in state]
+    if missing:
+      print('Checkpoint has no', missing, '- starting them from zero.')
+      init = self.save()
+      state = {**state, **{k: init[k] for k in missing}}
     if len(self.train_devices) == 1:
       self.varibs = jax.device_put(state, self.train_devices[0])
     else:
@@ -195,18 +229,24 @@ class JAXAgent(embodied.Agent):
     self._train = nj.pure(self.agent.train)
     self._report = nj.pure(self.agent.report)
     self._value = nj.pure(self.agent.value)
+    self._disag_measure = nj.pure(self.agent.disag_measure)
+    self._kl_measure = nj.pure(self.agent.kl_measure)
     if len(self.train_devices) == 1:
       kw = dict(device=self.train_devices[0])
       self._init_train = nj.jit(self._init_train, **kw)
-      self._train = nj.jit(self._train, **kw)
+      self._train = nj.jit(self._train, static=['rollouts'], **kw)
       self._report = nj.jit(self._report, **kw)
       self._value = nj.jit(self._value, **kw)
+      self._disag_measure = nj.jit(self._disag_measure, **kw)
+      self._kl_measure = nj.jit(self._kl_measure, **kw)
     else:
       kw = dict(devices=self.train_devices)
       self._init_train = nj.pmap(self._init_train, 'i', **kw)
-      self._train = nj.pmap(self._train, 'i', **kw)
+      self._train = nj.pmap(self._train, 'i', static=['rollouts'], **kw)
       self._report = nj.pmap(self._report, 'i', **kw)
       self._value = nj.pmap(self._value, 'i', **kw)
+      self._disag_measure = nj.pmap(self._disag_measure, 'i', **kw)
+      self._kl_measure = nj.pmap(self._kl_measure, 'i', **kw)
     if len(self.policy_devices) == 1:
       kw = dict(device=self.policy_devices[0])
       self._init_policy = nj.jit(self._init_policy, **kw)
@@ -265,7 +305,7 @@ class JAXAgent(embodied.Agent):
     data = self._dummy_batch({**obs_space, **act_space}, dims)
     data = self._convert_inps(data, self.train_devices)
     state, varibs = self._init_train(varibs, rng, data['is_first'])
-    varibs = self._train(varibs, rng, data, state, init_only=True)
+    varibs = self._train(varibs, rng, data, state, rollouts=1, init_only=True)
     # obs = self._dummy_batch(obs_space, (1,))
     # state, varibs = self._init_policy(varibs, rng, obs['is_first'])
     # varibs = self._policy(

@@ -25,8 +25,8 @@ class Greedy(nj.Module):
   def policy(self, latent, state):
     return self.ac.policy(latent, state)
 
-  def train(self, imagine, start, data):
-    return self.ac.train(imagine, start, data)
+  def train(self, imagine, start, data, rollouts=1, cutoff=None):
+    return self.ac.train(imagine, start, data, rollouts=rollouts, cutoff=cutoff)
 
   def report(self, data):
     return {}

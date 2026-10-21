@@ -1,11 +1,4 @@
 """Plot the 'learning/value_change' marker from one or more DreamerV3 logdirs.
-
-Usage:
-  python scores/plot_value_change.py LOGDIR [LOGDIR ...] [--logy] [--out PATH]
-
-Reads <logdir>/metrics.jsonl, collects (step, learning/value_change) pairs and
-draws one line per logdir. The figure is saved to <first logdir>/value_change.png
-unless --out is given.
 """
 
 import argparse

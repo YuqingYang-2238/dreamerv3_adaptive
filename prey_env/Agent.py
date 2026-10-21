@@ -1,4 +1,6 @@
 from cellworld import *
+from shapely.geometry import Polygon
+from geometry import Body
 
 
 class AgentAction(JsonObject):
@@ -14,14 +16,21 @@ class AgentData(JsonObject):
                  ptheta: float,
                  pspeed: float,
                  pturning_speed: float,
-                 pcolor: str = "b",
+                 pbody: Body,
                  pauto_update=True):
-        self.location = plocation
-        self.theta = ptheta
+        self.body = pbody
+        self.set_pose(plocation, ptheta)
         self.speed = pspeed
         self.turning_speed = pturning_speed
-        self.color = pcolor
         self.auto_update = pauto_update
+
+    def set_pose(self, location: Location, theta: float, polygon: Polygon = None):
+        """Pose plus the body in the world frame (polygon for collision, points for line of sight)."""
+        self.location = location
+        self.theta = theta
+        self.body_points = self.body.points(location.x, location.y, theta)
+        self.body_polygon = polygon or Polygon(self.body_points)
+        self.los_points = self.body.points(location.x, location.y, theta, self.body.los_local)
 
 
 class Agent:

@@ -24,6 +24,8 @@ class PreyFromGym(from_gym.FromGym):
       'log_timeout': embodied.Space(bool),       # truncated this step (no goal)
       'log_pred_x': embodied.Space(np.float32),  # true predator position,
       'log_pred_y': embodied.Space(np.float32),  # visible or not (for plots)
+      'log_zone': embodied.Space(np.int32),      # ambush zone of this episode (-1: default predator)
+      'log_surge': embodied.Space(np.int32),     # ambush surges started during this step
   }
 
   @functools.cached_property
@@ -42,5 +44,11 @@ class PreyFromGym(from_gym.FromGym):
         log_success=bool(info.get('survived', False)),
         log_timeout=bool(info.get('is truncated', False)) and not goal,
         log_pred_x=np.float32(predator.location.x if predator else -1.0),
-        log_pred_y=np.float32(predator.location.y if predator else -1.0))
+        log_pred_y=np.float32(predator.location.y if predator else -1.0),
+        log_zone=np.int32(getattr(self._env, 'ambush_zone', -1)),
+        log_surge=np.int32(info.get('surges_this_step', 0)))
     return out
+
+  def reset_memory(self):
+    """Clears the ambush zone window (no-op for the default predator)."""
+    self._env.zone_history.clear()

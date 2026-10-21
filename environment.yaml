@@ -21,6 +21,9 @@ dependencies:
       - msgpack
       - gym==0.26.2                 
       - gymnasium==0.28.1            
-      - cellworld==0.0.381           
+      - cellworld==0.0.381
       - matplotlib
+      - shapely>=2.0                # agent bodies, collision, line of sight (prey_env/geometry.py)
+      - pygame>=2.6                 # offscreen Mice-look frames for the videos (prey_env/render.py)
+      - moviepy==1.0.3              # episode MP4 videos (prey_env/video.py), same as the Mice env
       - requests

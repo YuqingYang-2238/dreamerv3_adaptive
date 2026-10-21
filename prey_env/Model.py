@@ -1,125 +1,74 @@
-import time
-from threading import Thread
-from cellworld import *
+import math
+
+from cellworld import World, Location, normalize
+
 from Agent import Agent, AgentData, AgentAction
+from geometry import Geometry, Body, MOUSE, ROBOT
+
 
 class Model:
+    """Agents with bodies in one world: movement with collision, line of sight (after cellworld_game)."""
 
-    def __init__(self,
-                 pworld: World,
-                 freq: int = 100,
-                 real_time: bool = False):
-        self.real_time = real_time
+    def __init__(self, pworld: World, freq: int = 100):
         self.world = pworld
         self.agents = dict()
         self.agents_data = dict()
-        self.display = Display(self.world, animated=True, fig_size=(6, 6))
-        self.thread = None
-        self.running = False
         self.interval = 1 / freq
-        self.arena_polygon = Polygon(self.world.implementation.space.center, 6,
-                                     self.world.implementation.space.transformation.size / 2,
-                                     self.world.implementation.space.transformation.rotation)
-        self.occlusions_polygons = Polygon_list.get_polygons([c.location for c in self.world.cells.occluded_cells()],
-                                                             6,
-                                                             self.world.implementation.cell_transformation.size / 2 * 1.05,
-                                                             self.world.implementation.cell_transformation.rotation)
-        self.visibility = Location_visibility(occlusions=self.occlusions_polygons)
+        self.geometry = Geometry(self.world)
+        self.visibility = self.geometry   # is_visible(src, dst), as cellworld's Location_visibility
+        self.blocked = dict()             # per agent: ticks where the full move was rejected
 
-    def is_valid_location(self, plocation):
-        if self.arena_polygon.contains(plocation):
-            for p in self.occlusions_polygons:
-                if p.contains(plocation):
-                    return False
-            return True
-        else:
-            return False
+    def add_agent(self, pagent_name: str, pagent: Agent, plocation: Location, ptheta: float,
+                  pauto_update: bool = True, pbody: Body = None):
+        # Mice bodies. Predator: no occlusion collision, as in Mice. Prey: collides as a disc of
+        # half its length (the polygon rule wedges a forward-only mouse against walls).
+        if pbody is None:
+            pbody = Body(ROBOT, collision=False) if pagent_name == "predator" else Body(MOUSE, collision_radius=.015)
+        self.agents[pagent_name] = pagent
+        self.agents_data[pagent_name] = AgentData(plocation, ptheta, 0, 0, pbody, pauto_update=pauto_update)
+        self.blocked[pagent_name] = 0
 
-    def run(self):
-        self.running = True
-        self.thread = Thread(target=self.__process__)
-        self.thread.start()
-
-    def __move_agent__(self, agent_name):
-        agent = self.agents_data[agent_name]
-        agent.theta = normalize(agent.theta + agent.turning_speed * self.interval)
-        new_location = Location(agent.location.x, agent.location.y)
-        new_location.move(theta=agent.theta, dist=agent.speed * self.interval)
-        if self.is_valid_location(new_location):
-            self.agents_data[agent_name].location = new_location
-
-    def stop(self):
-        if self.thread:
-            self.running = False
-            self.thread.join()
-
-    def __process__(self):
-        t = Timer(self.interval)
-        while self.running:
-            t.reset()
-            self.step()
-            if self.real_time:
-                pending_wait = self.interval - t.to_seconds()
-                if pending_wait > 0:
-                    time.sleep(pending_wait)
-
-
-    def step(self):
-        for agent_name in self.agents.keys():
-            if self.agents_data[agent_name].auto_update:
-                action = self.agents[agent_name].get_action(self.get_observation(agent_name))
-                self.agents_data[agent_name].speed = action.speed
-                self.agents_data[agent_name].turning_speed = action.turning_speed
-        for agent_name in self.agents.keys():
-            self.__move_agent__(agent_name)
+    def set_agent_position(self, pagent_name: str, plocation: Location, ptheta: float):
+        self.agents_data[pagent_name].set_pose(plocation, ptheta)
 
     def set_agent_action(self, agent_name: str, action: AgentAction):
         self.agents_data[agent_name].speed = action.speed
         self.agents_data[agent_name].turning_speed = action.turning_speed
 
-    def __create_observation__(self, agent_name: str) -> dict:
-        observation = dict()
+    def is_valid_pose(self, body: Body, location: Location, polygon) -> bool:
+        if body.collision_radius:
+            return self.geometry.is_valid_disc((location.x, location.y), body.collision_radius)
+        return self.geometry.is_valid(polygon, body.collision)
+
+    def __move_agent__(self, agent_name):
+        agent = self.agents_data[agent_name]
+        rotation = agent.turning_speed * self.interval
+        distance = agent.speed * self.interval
+        # Mice Model.step: full move, else rotation only, else translation only, else stay.
+        for i, (rot, dist) in enumerate(((rotation, distance), (rotation, 0), (0, distance))):
+            theta = normalize(agent.theta + rot)
+            location = Location(agent.location.x + math.cos(theta) * dist,
+                                agent.location.y + math.sin(theta) * dist)
+            polygon = agent.body.polygon(location.x, location.y, theta)
+            if self.is_valid_pose(agent.body, location, polygon):
+                agent.set_pose(location, theta, polygon)
+                break
+            if i == 0:
+                self.blocked[agent_name] += 1
+
+    def step(self):
+        for agent_name, agent in self.agents.items():
+            if self.agents_data[agent_name].auto_update:
+                self.set_agent_action(agent_name, agent.get_action(self.get_observation(agent_name)))
+        for agent_name in self.agents:
+            self.__move_agent__(agent_name)
+
+    def sees(self, agent_name: str, other_name: str) -> bool:
+        """Mice line of sight: any part of the other body is visible from this agent's centre."""
         src = self.agents_data[agent_name].location
-        for dst_agent_name in self.agents_data:
-            dst_agent_data = self.agents_data[dst_agent_name]
-            if self.visibility.is_visible(src, dst_agent_data.location):
-                observation[dst_agent_name] = dst_agent_data
-            else:
-                observation[dst_agent_name] = None
-        return observation
+        return self.geometry.body_visible((src.x, src.y), self.agents_data[other_name].los_points)
 
     def get_observation(self, agent_name: str) -> dict:
-        return self.__create_observation__(agent_name)
-
-    def show(self):
-        for agent_name in self.agents_data:
-            agent_data = self.agents_data[agent_name]
-            self.display.agent(agent_name=agent_name,
-                               location=agent_data.location,
-                               rotation=to_degrees(agent_data.theta),
-                               color=agent_data.color,
-                               size=15,
-                               show_trajectory=False)
-        self.display.update()
-
-    def set_agent_position(self, pagent_name: str,
-                           plocation: Location,
-                           ptheta: float):
-        self.agents_data[pagent_name].location = plocation
-        self.agents_data[pagent_name].theta = ptheta
-
-    def add_agent(self,
-                  pagent_name: str,
-                  pagent: Agent,
-                  plocation: Location,
-                  ptheta: float,
-                  pcolor: str = "b",
-                  pauto_update: bool = True):
-        self.agents[pagent_name] = pagent
-        self.agents_data[pagent_name] = AgentData(plocation=plocation,
-                                                  ptheta=ptheta,
-                                                  pspeed=0,
-                                                  pturning_speed=0,
-                                                  pcolor=pcolor,
-                                                  pauto_update=pauto_update)
-        self.display.set_agent_marker(pagent_name, Agent_markers.arrow())
+        """{name: AgentData or None if not in line of sight}."""
+        return {name: data if name == agent_name or self.sees(agent_name, name) else None
+                for name, data in self.agents_data.items()}

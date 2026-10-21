@@ -63,6 +63,8 @@ class Batcher:
     else:
       elems = [next(x) for x in self._iterators]
       batch = {k: np.stack([x[k] for x in elems], 0) for k in elems[0]}
+      if self._postprocess:
+        batch = self._postprocess(batch)
     if isinstance(batch, Exception):
       raise batch
     return batch
